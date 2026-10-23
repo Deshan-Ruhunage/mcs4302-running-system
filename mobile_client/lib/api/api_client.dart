@@ -1,4 +1,5 @@
-// FINAL version (Part 4 onward): retry with backoff + idempotency keys.
+// Week 5 version: Week 4 client (retry with backoff + idempotency keys)
+// plus calls to the background-job log. Also used from the background job.
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -141,5 +142,42 @@ class ApiClient {
   /// Resets the backend's items and random seed (repeatable experiments).
   Future<void> reset(int seed) async {
     await _send(() => _http.post(_uri('/reset', {'seed': '$seed'})));
+  }
+
+  // ---- Week 5: background-job log (timestamps come from the server clock) ----
+
+  /// Records a job event ('scheduled' or 'ran'). Retrying this POST is
+  /// harmless: if a duplicate arrives, the summary uses the FIRST event of
+  /// each kind, so the log tolerates at-least-once delivery.
+  Future<void> logJob({
+    required String jobId,
+    required String label,
+    required String event,
+    double requestedDelaySeconds = 0,
+    String detail = '',
+  }) =>
+      withRetry(() async {
+        await _send(() => _http.post(
+              _uri('/job-log'),
+              headers: {'Content-Type': 'application/json'},
+              body: jsonEncode({
+                'job_id': jobId,
+                'label': label,
+                'event': event,
+                'requested_delay_s': requestedDelaySeconds,
+                'detail': detail,
+              }),
+            ));
+      }, retryPolicy);
+
+  /// One row per job: scheduled_at, ran_at, total_s, extra_delay_s, ...
+  Future<List<Map<String, dynamic>>> getJobSummary() => withRetry(() async {
+        final data = _decode(await _send(() => _http.get(_uri('/job-log/summary'))));
+        if (data is! List) throw ApiException('Expected a list of jobs');
+        return data.whereType<Map<String, dynamic>>().toList();
+      }, retryPolicy);
+
+  Future<void> clearJobLog() async {
+    await _send(() => _http.delete(_uri('/job-log')));
   }
 }

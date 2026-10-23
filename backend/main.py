@@ -1,17 +1,23 @@
-"""MCS4302 Week 4 lab backend: items API + fault-injection endpoints.
+"""MCS4302 running-system backend (Week 5): items API, fault-injection endpoints
+and a background-job log.
+
+Week 5 adds /job-log. Timestamps are taken from the SERVER clock, so an
+emulator whose clock drifts cannot distort the measured job delays.
 
 Run:  uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 Docs: http://localhost:8000/docs
 """
 import asyncio
 import random
-from typing import Optional
+import time
+from datetime import datetime
+from typing import Literal, Optional
 
 from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.responses import Response
 from pydantic import BaseModel, Field, field_validator
 
-app = FastAPI(title="MCS4302 Week 4 backend")
+app = FastAPI(title="MCS4302 running system backend (Week 5)")
 
 
 class ItemIn(BaseModel):
@@ -113,5 +119,115 @@ async def bad_json():
 async def reset(seed: int = 42):
     global rng
     rng = random.Random(seed)
-    seed_items()
+    seed_items()  # the job log is NOT cleared here; use DELETE /job-log
     return {"status": "reset", "seed": seed}
+
+
+# ---------------------------------------------------------------------------
+# Week 5: background-job log
+# ---------------------------------------------------------------------------
+class JobEventIn(BaseModel):
+    job_id: str = Field(min_length=1, max_length=80)
+    label: str = Field(default="", max_length=40)
+    event: Literal["scheduled", "started", "ran"]
+    requested_delay_s: float = Field(default=0.0, ge=0.0, le=86400.0)
+    detail: str = Field(default="", max_length=200)
+
+
+class JobEvent(JobEventIn):
+    server_time: float  # seconds since the epoch, server clock
+    server_clock: str   # same instant, readable (HH:MM:SS.mmm)
+
+
+job_log: list[JobEvent] = []
+
+
+def _clock(t: float) -> str:
+    return datetime.fromtimestamp(t).strftime("%H:%M:%S.%f")[:-3]
+
+
+@app.post("/job-log", response_model=JobEvent, status_code=201)
+async def add_job_event(event: JobEventIn):
+    now = time.time()
+    entry = JobEvent(**event.model_dump(), server_time=now, server_clock=_clock(now))
+    job_log.append(entry)
+    print(f"[JOB-LOG] {entry.server_clock} {entry.event:9s} {entry.job_id} {entry.detail}")
+    return entry
+
+
+@app.get("/job-log", response_model=list[JobEvent])
+async def list_job_events():
+    return job_log
+
+
+@app.get("/job-log/summary")
+async def job_summary():
+    """One row per job, from the events the worker REPORTED (observed times).
+
+    Events: 'scheduled' (app registered the job), 'started' (the worker began,
+    before any network work), 'ran' (the worker finished its work).
+
+    extra_delay_s = (started - scheduled) - requested_delay_s. This is the time
+    beyond the requested minimum delay until the worker began: mostly the
+    deferral by Android, plus worker start-up and the small cost of logging.
+    work_s = ran - started: the job's own work (fetch /items, network).
+    'started' but no 'ran' means the worker has not reported success yet: it may
+    still be running, be waiting to retry, or have failed. Check Logcat.
+    """
+    jobs: dict[str, dict] = {}
+    for e in job_log:
+        row = jobs.setdefault(e.job_id, {
+            "job_id": e.job_id, "label": e.label, "requested_delay_s": 0.0,
+            "scheduled": None, "started": None, "ran": None, "runs": 0, "detail": "",
+        })
+        if e.label:
+            row["label"] = e.label
+        if e.event == "scheduled":
+            row["requested_delay_s"] = e.requested_delay_s
+        if e.event == "ran":
+            row["runs"] += 1
+            if row["ran"] is None:
+                row["detail"] = e.detail
+        if row[e.event] is None:  # keep the FIRST event of each kind
+            row[e.event] = e.server_time
+
+    def clock(t):
+        return _clock(t) if t is not None else None
+
+    def diff(a, b):
+        return round(b - a, 1) if a is not None and b is not None else None
+
+    now = time.time()
+    result = []
+    for row in sorted(jobs.values(),
+                      key=lambda r: r["scheduled"] or r["started"] or r["ran"] or 0):
+        s, st, r = row["scheduled"], row["started"], row["ran"]
+        to_start = diff(s, st)
+        if r is not None:
+            status = "done"
+        elif st is not None:
+            status = "started, not finished"
+        else:
+            status = "waiting"
+        result.append({
+            "job_id": row["job_id"],
+            "label": row["label"],
+            "requested_delay_s": row["requested_delay_s"],
+            "scheduled_at": clock(s),
+            "started_at": clock(st),
+            "ran_at": clock(r),
+            "extra_delay_s": round(to_start - row["requested_delay_s"], 1)
+            if to_start is not None else None,
+            "work_s": diff(st, r),
+            "waiting_s": round(now - s, 1) if s is not None and st is None else None,
+            "status": status,
+            "runs": row["runs"],
+            "detail": row["detail"],
+        })
+    return result
+
+
+@app.delete("/job-log")
+async def clear_job_log():
+    job_log.clear()
+    return {"status": "cleared"}

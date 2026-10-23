@@ -2,10 +2,19 @@ import 'package:flutter/material.dart';
 
 import 'api/api_client.dart';
 import 'api/api_exceptions.dart';
+import 'background_jobs.dart';
 import 'experiment_screen.dart';
+import 'jobs_screen.dart';
+import 'lifecycle_log.dart';
 import 'models/item.dart';
+import 'notifications.dart';
 
-void main() => runApp(const App());
+Future<void> main() async {
+  LifecycleLog.add('process started: main()');
+  WidgetsFlutterBinding.ensureInitialized();
+  await BackgroundJobs.init(); // Week 5 Part 4: register the job entry point
+  runApp(const App());
+}
 
 class App extends StatelessWidget {
   const App({super.key});
@@ -13,6 +22,8 @@ class App extends StatelessWidget {
   @override
   Widget build(BuildContext context) => MaterialApp(
         title: 'MCS4302 Running System',
+        // Week 5 Part 2: turns on state restoration for the whole app.
+        restorationScopeId: 'app',
         theme: ThemeData(useMaterial3: true, colorSchemeSeed: Colors.indigo),
         home: const ItemsScreen(),
       );
@@ -25,21 +36,129 @@ class ItemsScreen extends StatefulWidget {
   State<ItemsScreen> createState() => _ItemsScreenState();
 }
 
-class _ItemsScreenState extends State<ItemsScreen> {
+// Week 5 Part 1: WidgetsBindingObserver delivers app lifecycle changes.
+// Week 5 Part 2: RestorationMixin saves small UI state that Android hands
+// back after it kills and recreates the process.
+class _ItemsScreenState extends State<ItemsScreen>
+    with WidgetsBindingObserver, RestorationMixin {
   final api = ApiClient();
   late Future<List<Item>> _future;
   bool _busy = false;
 
+  // Part 2: the same UI state, now restorable. Android stores it in the
+  // saved instance state (a small bundle), not in a database.
+  final _draft = RestorableTextEditingController();
+  final _sortByPrice = RestorableBool(false);
+
   @override
-  void dispose() {
-    api.close();
-    super.dispose();
+  String? get restorationId => 'items_screen';
+
+  @override
+  void restoreState(RestorationBucket? oldBucket, bool initialRestore) {
+    registerForRestoration(_draft, 'draft');
+    registerForRestoration(_sortByPrice, 'sort_by_price');
+    LifecycleLog.add('restoreState: draft="${_draft.value.text}", '
+        'sortByPrice=${_sortByPrice.value}');
   }
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    LifecycleLog.add('ItemsScreen created (initState)');
     _future = api.getItems();
+  }
+
+  @override
+  void dispose() {
+    LifecycleLog.add('ItemsScreen disposed');
+    WidgetsBinding.instance.removeObserver(this);
+    _draft.dispose();
+    _sortByPrice.dispose();
+    api.close();
+    super.dispose();
+  }
+
+  /// Called by the framework whenever the app's lifecycle state changes:
+  /// resumed, inactive, hidden, paused or detached.
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    LifecycleLog.add('state -> ${state.name}');
+  }
+
+  /// Menu entries that open something rather than run a test.
+  void _onMenu(String which) {
+    switch (which) {
+      case 'lifelog':
+        showLifecycleLog(context);
+      case 'notify':
+        _notificationCheck();
+      case 'jobs':
+        Navigator.push(context,
+            MaterialPageRoute(builder: (_) => JobsScreen(api: api)));
+      default:
+        _runTest(which);
+    }
+  }
+
+  /// Week 5 Part 3: check, request or test the notification permission.
+  Future<void> _notificationCheck() async {
+    final allowed = await Notifications.isEnabled();
+    LifecycleLog.add('notifications allowed: $allowed');
+    if (!mounted) return;
+    final choice = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Notifications'),
+        content: Text(allowed
+            ? 'Notifications are allowed for this app.'
+            : 'Notifications are NOT allowed for this app.'),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, 'settings'),
+              child: const Text('Open settings')),
+          if (!allowed)
+            FilledButton(
+                onPressed: () => Navigator.pop(ctx, 'request'),
+                child: const Text('Request')),
+          if (allowed)
+            FilledButton(
+                onPressed: () => Navigator.pop(ctx, 'test'),
+                child: const Text('Send test')),
+        ],
+      ),
+    );
+    String? msg;
+    switch (choice) {
+      case 'request':
+        // Time the call: a very fast "false" means Android showed no dialog.
+        final sw = Stopwatch()..start();
+        final granted = await Notifications.request();
+        sw.stop();
+        msg = 'Request returned $granted after ${sw.elapsedMilliseconds} ms';
+        if (!granted && mounted) {
+          // Refused: tell the user how to fix it themselves.
+          ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+            content: const Text('Notifications are off. You can turn them on '
+                'in the app settings.'),
+            action: SnackBarAction(
+                label: 'Settings', onPressed: Notifications.openSettings),
+          ));
+          LifecycleLog.add(msg);
+          return;
+        }
+      case 'test':
+        await Notifications.show(
+            id: 1, title: 'MCS4302', body: 'Test notification from the app');
+        msg = 'Test notification sent';
+      case 'settings':
+        await Notifications.openSettings();
+    }
+    if (msg == null) return;
+    LifecycleLog.add(msg);
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+    }
   }
 
   void _refresh() {
@@ -164,8 +283,12 @@ class _ItemsScreenState extends State<ItemsScreen> {
           IconButton(icon: const Icon(Icons.refresh), onPressed: _busy ? null : _refresh),
           PopupMenuButton<String>(
             enabled: !_busy,
-            onSelected: _runTest,
+            onSelected: _onMenu,
             itemBuilder: (_) => const [
+              PopupMenuItem(value: 'lifelog', child: Text('Lifecycle log')),
+              PopupMenuItem(value: 'notify', child: Text('Notifications')),
+              PopupMenuItem(value: 'jobs', child: Text('Background jobs')),
+              PopupMenuDivider(),
               PopupMenuItem(value: 'slow', child: Text('Test /slow (3 s)')),
               PopupMenuItem(value: 'flaky', child: Text('Test /flaky (30%)')),
               PopupMenuItem(value: 'bad', child: Text('Test /bad-json')),
@@ -194,7 +317,30 @@ class _ItemsScreenState extends State<ItemsScreen> {
       ),
       floatingActionButton: FloatingActionButton(
           onPressed: _busy ? null : _addItem, child: const Icon(Icons.add)),
-      body: FutureBuilder<List<Item>>(
+      body: Column(children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+          child: TextField(
+            controller: _draft.value,
+            decoration: const InputDecoration(
+              labelText: 'Draft note (restorable)',
+              border: OutlineInputBorder(),
+            ),
+          ),
+        ),
+        SwitchListTile(
+          title: const Text('Sort by price'),
+          value: _sortByPrice.value,
+          onChanged: (v) => setState(() => _sortByPrice.value = v),
+        ),
+        const Divider(height: 1),
+        Expanded(child: _itemList()),
+      ]),
+    );
+  }
+
+  Widget _itemList() {
+    return FutureBuilder<List<Item>>(
         future: _future,
         builder: (context, snap) {
           if (snap.connectionState != ConnectionState.done) {
@@ -208,7 +354,8 @@ class _ItemsScreenState extends State<ItemsScreen> {
               ),
             );
           }
-          final items = snap.data!;
+          final items = [...snap.data!];
+          if (_sortByPrice.value) items.sort((a, b) => a.price.compareTo(b.price));
           return ListView.builder(
             itemCount: items.length,
             itemBuilder: (_, i) => ListTile(
@@ -218,7 +365,6 @@ class _ItemsScreenState extends State<ItemsScreen> {
             ),
           );
         },
-      ),
     );
   }
 }
