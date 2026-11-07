@@ -234,3 +234,6 @@ async def clear_job_log():
 
 from week6 import router as week6_router
 app.include_router(week6_router)
+
+from week7 import router as week7_router
+app.include_router(week7_router)
