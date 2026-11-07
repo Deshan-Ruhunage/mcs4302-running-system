@@ -231,3 +231,6 @@ async def job_summary():
 async def clear_job_log():
     job_log.clear()
     return {"status": "cleared"}
+
+from week6 import router as week6_router
+app.include_router(week6_router)
